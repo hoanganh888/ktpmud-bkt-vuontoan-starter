@@ -244,12 +244,32 @@
       <select id="question-set-select" class="${inputCls} max-w-xs"></select>
     </div>
     <form id="question-form" class="grid grid-cols-1 md:grid-cols-6 gap-3 mt-3">
-      <select name="type" class="${inputCls}"><option value="multiple-choice">Trắc nghiệm</option><option value="input">Điền số</option><option value="compare">Điền dấu &gt; &lt; =</option><option value="paint">Tô màu</option></select>
+      <select name="type" class="${inputCls}">
+        <option value="multiple-choice">Trắc nghiệm</option>
+        <option value="input">Điền số</option>
+        <option value="compare">Điền dấu &gt; &lt; =</option>
+        <option value="paint">Tô màu</option>
+        <option value="estimate">Ước lượng</option>
+      </select>
       <input name="prompt" placeholder="Nội dung câu hỏi (VD: 7 × 6 = ?)" class="${inputCls} md:col-span-3" required/>
       <input name="points" type="number" value="5" min="1" class="${inputCls}"/>
       <button class="${btnCls}" id="question-submit-btn">Thêm câu hỏi</button>
       <input name="options" placeholder="Các lựa chọn, cách nhau bởi dấu phẩy (trắc nghiệm): 36, 42, 48, 40" class="${inputCls} md:col-span-3"/>
-      <input name="correctAnswer" placeholder="Đáp án đúng: A/B/C/D, số, dấu, green/yellow" class="${inputCls} md:col-span-2" required/>
+      <input name="correctAnswer" placeholder="Đáp án chính xác (ví dụ: 500)" class="${inputCls} md:col-span-2" required/>
+      <label id="estimate-tolerance-field"
+    class="hidden md:col-span-2 flex flex-col justify-center gap-1 text-sm text-on-surface-variant">
+
+    Sai số cho phép (%) 
+
+    <input name="deltaPercent"
+        type="number"
+        value="10"
+        min="0"
+        max="100"
+        step="0.1"
+        class="${inputCls}" />
+</label>
+      </label>
       <button type="button" id="question-cancel" class="hidden ${smallBtn}">Hủy sửa</button>
     </form>
     <p id="question-msg" class="mt-2 font-label-md text-label-md"></p>
@@ -287,16 +307,35 @@
     wrap.querySelector('[name="unlockAfter"]').innerHTML = '<option value="">Mở tự do</option>' + opts;
     wrap.querySelector('[name="lessonId"]').innerHTML = '<option value="">Không gắn bài nào</option>' + lessons.map(l => `<option value="${l.id}">Bài ${l.number}: ${esc(l.title)}</option>`).join('');
   }
-  async function loadSets() {
+    async function loadSets() {
+    // Lưu lại bộ đề giáo viên đang chọn
+    const previousSetId = $('question-set-select').value;
+
     const { questionSets } = await window.MathAPI.get('/api/teacher/question-sets');
     setsCache = questionSets;
+
     $('set-list').innerHTML = questionSets.map(s => `
       <span class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-surface-container font-label-md text-label-sm">
         <strong>${esc(s.title)}</strong> (${s.question_count} câu${s.lesson_number ? ` • Bài ${s.lesson_number}` : ''})
         <button class="${smallBtn}" data-del-set="${s.id}" title="Xóa bộ đề">✕</button></span>`).join('');
-    $('question-set-select').innerHTML = questionSets.map(s => `<option value="${s.id}">${esc(s.title)}</option>`).join('');
-    $('assignment-set-select').innerHTML = setsCache.map(s => `<option value="${s.id}">${esc(s.title)}</option>`).join('');
-    loadQuestions();
+
+    // Tải lại danh sách nhưng giữ nguyên bộ đề đang chọn
+    $('question-set-select').innerHTML = questionSets.map(s =>
+      `<option value="${s.id}">${esc(s.title)}</option>`
+    ).join('');
+
+    // Khôi phục bộ đề cũ nếu nó vẫn tồn tại
+    if (questionSets.some(s => s.id === previousSetId)) {
+        $('question-set-select').value = previousSetId;
+    }
+
+    $('assignment-set-select').innerHTML = setsCache.map(s =>
+      `<option value="${s.id}">${esc(s.title)}</option>`
+    ).join('');
+
+    // Tải lại câu hỏi của đúng bộ đề đang chọn
+    await loadQuestions();
+
   }
   async function loadAssignClasses() {
     const { students } = await window.MathAPI.get('/api/teacher/students');
@@ -322,7 +361,7 @@
         <span class="font-headline-sm text-label-sm text-primary">Câu ${i + 1}</span>
         <span class="flex-1 min-w-[200px] font-body-sm">${esc(q.prompt)}${q.options ? ` <em class="text-on-surface-variant">[${q.options.map(esc).join(' / ')}]</em>` : ''}</span>
         <span class="font-label-sm">Đáp án: <strong>${esc(q.correct_answer)}</strong> • ${q.points}đ</span>
-        <button class="${smallBtn}" data-edit-question='${esc(JSON.stringify({ id: q.id, type: q.type, prompt: q.prompt, options: q.options || [], correctAnswer: q.correct_answer, points: q.points }))}'>Sửa</button>
+        <button class="${smallBtn}" data-edit-question='${esc(JSON.stringify({ id: q.id, type: q.type, prompt: q.prompt, options: q.options || [], correctAnswer: q.correct_answer, points: q.points, deltaPercent: q.delta_percent ?? 10 }))}'>Sửa</button>
         <button class="${smallBtn}" data-del-question="${q.id}">Xóa</button>
       </div>`).join('');
   }
@@ -352,11 +391,33 @@
   });
 
   $('question-set-select').addEventListener('change', loadQuestions);
+  // Ẩn/hiện ô sai số theo loại câu hỏi
+const estimateToleranceField = $('estimate-tolerance-field');
+const questionTypeSelect = $('question-form').elements.type;
+
+function updateEstimateToleranceVisibility() {
+    const isEstimate = questionTypeSelect.value === 'estimate';
+
+    estimateToleranceField.classList.toggle(
+        'hidden',
+        !isEstimate
+    );
+}
+
+// Khi giáo viên thay đổi loại câu hỏi
+questionTypeSelect.addEventListener(
+    'change',
+    updateEstimateToleranceVisibility
+);
+
+// Kiểm tra trạng thái ban đầu
+updateEstimateToleranceVisibility();
   $('question-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = Object.fromEntries(new FormData(e.target).entries());
     fd.options = fd.options ? fd.options.split(',').map(s => s.trim()).filter(Boolean) : undefined;
     if (fd.type !== 'multiple-choice') fd.options = undefined;
+    fd.deltaPercent = Number(fd.deltaPercent ?? 10);
     try {
       if (editingQuestion) {
         await window.MathAPI.put(`/api/teacher/questions/${editingQuestion}`, fd);
@@ -365,11 +426,24 @@
         await window.MathAPI.post(`/api/teacher/question-sets/${encodeURIComponent($('question-set-select').value)}/questions`, fd);
         $('question-msg').textContent = '✅ Đã thêm câu hỏi.';
       }
-      editingQuestion = null; e.target.reset(); e.target.points.value = 5; $('question-submit-btn').textContent = 'Thêm câu hỏi'; $('question-cancel').classList.add('hidden');
-      loadQuestions(); loadSets();
+      editingQuestion = null; 
+      e.target.reset(); 
+      e.target.points.value = 5; 
+      e.target.deltaPercent.value = 10; 
+      updateEstimateToleranceVisibility();
+      $('question-submit-btn').textContent = 'Thêm câu hỏi'; 
+      $('question-cancel').classList.add('hidden');
+      // Cập nhật số lượng câu hỏi và giữ nguyên bộ đề
+      await loadSets();
     } catch (err) { $('question-msg').textContent = `⚠️ ${err.message}`; }
   });
-  $('question-cancel').addEventListener('click', () => { editingQuestion = null; $('question-form').reset(); $('question-submit-btn').textContent = 'Thêm câu hỏi'; $('question-cancel').classList.add('hidden'); });
+  $('question-cancel').addEventListener('click', () => { 
+    editingQuestion = null; 
+    $('question-form').reset(); 
+    $('question-form').deltaPercent.value = 10; 
+    updateEstimateToleranceVisibility();
+    $('question-submit-btn').textContent = 'Thêm câu hỏi'; 
+    $('question-cancel').classList.add('hidden'); });
 
   $('assignment-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -406,8 +480,17 @@
         const q = JSON.parse(editQ.dataset.editQuestion);
         editingQuestion = q.id;
         const f = $('question-form');
-        f.type.value = q.type; f.prompt.value = q.prompt; f.points.value = q.points;
-        f.options.value = (q.options || []).join(', '); f.correctAnswer.value = q.correctAnswer;
+        f.type.value = q.type; 
+        f.prompt.value = q.prompt; 
+        f.points.value = q.points;
+        updateEstimateToleranceVisibility();
+        f.options.value = (q.options || []).join(', '); 
+        f.correctAnswer.value = q.correctAnswer; 
+        if (fd.type === 'estimate') {
+    fd.deltaPercent = Number(fd.deltaPercent ?? 10);
+} else {
+    delete fd.deltaPercent;
+}
         $('question-submit-btn').textContent = 'Lưu thay đổi'; $('question-cancel').classList.remove('hidden');
       }
       if (delQ && confirm('Xóa câu hỏi này?')) { await window.MathAPI.del(`/api/teacher/questions/${delQ.dataset.delQuestion}`); loadQuestions(); loadSets(); }

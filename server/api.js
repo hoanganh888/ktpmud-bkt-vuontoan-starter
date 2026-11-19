@@ -8,6 +8,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const db = require('./db');
 const { setAuthCookie, clearAuthCookie, requireAuth, requireTeacher } = require('./auth');
+const { evaluateEstimate, calculateEstimateScore } = require('./estimate');
 
 const router = express.Router();
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
@@ -160,6 +161,18 @@ router.get('/question-sets/:setId/questions', requireAuth, (req, res) => {
   res.json({ setId: req.params.setId, questions: rows.map(r => ({ ...r, options: r.options_json ? JSON.parse(r.options_json) : undefined, options_json: undefined })) });
 });
 
+/* Kiểm tra ước lượng: chỉ trả trạng thái/feedback, tuyệt đối không trả đáp án đúng. */
+router.post('/estimate/check', requireAuth, (req, res) => {
+  const { questionId, estimate } = req.body || {};
+  if (estimate === undefined || String(estimate).trim() === '' || !Number.isFinite(Number(estimate))) {
+    return res.status(400).json({ error: 'Em hãy nhập một số hợp lệ để kiểm tra ước lượng.' });
+  }
+  const q = db.prepare("SELECT correct_answer,delta_percent FROM questions WHERE id=? AND type='estimate'").get(questionId);
+  if (!q) return res.status(404).json({ error: 'Không tìm thấy câu hỏi ước lượng.' });
+  const result = evaluateEstimate(estimate, q.correct_answer, q.delta_percent);
+  res.json({ status: result.status, message: result.message });
+});
+
 /* ---------------- Nộp bài & chấm điểm trên server ---------------- */
 // Metadata bộ bài lấy từ bảng question_sets (giáo viên tạo bộ mới là nộp/chấm được ngay)
 function setMeta(setId) {
@@ -174,18 +187,32 @@ router.post('/submissions', requireAuth, (req, res) => {
   let earned = 0, max = 0, correct = 0;
   const detail = questions.map(q => {
     max += q.points;
-    const given = answers[q.id] == null ? '' : String(answers[q.id]).trim().toLowerCase();
+    const raw = answers[q.id];
+    if (q.type === 'estimate') {
+      const answer = raw && typeof raw === 'object' ? raw : {};
+      const estimatePresent = answer.estimate !== undefined && String(answer.estimate).trim() !== '';
+      const estimateResult = estimatePresent
+        ? evaluateEstimate(answer.estimate, q.correct_answer, q.delta_percent)
+        : { status: 'unknown', message: 'Em chưa kiểm tra kết quả ước lượng.' };
+      const exactGiven = answer.exactAnswer == null ? '' : String(answer.exactAnswer).trim();
+      const exactOk = exactGiven !== '' && exactGiven.toLowerCase() === String(q.correct_answer).trim().toLowerCase();
+      const pointsEarned = calculateEstimateScore(q.points, estimateResult.status, exactOk);
+      earned += pointsEarned;
+      const fullyCorrect = pointsEarned >= q.points;
+      if (fullyCorrect) correct++;
+      return { questionId: q.id, correct: fullyCorrect, pointsEarned,
+        estimateStatus: estimateResult.status, feedback: estimateResult.message,
+        exactAnswerCorrect: exactOk, correctAnswer: q.correct_answer };
+    }
+    const given = raw == null ? '' : String(raw).trim().toLowerCase();
     const ok = given === String(q.correct_answer).trim().toLowerCase();
     if (ok) { earned += q.points; correct++; }
     return { questionId: q.id, correct: ok, correctAnswer: q.correct_answer };
   });
   const percent = max ? Math.round((earned / max) * 100) : 0;
-
-  // Sao thưởng chỉ tính trên phần % tiến bộ so với điểm cao nhất cũ (chống "cày" sao bằng cách nộp lại)
   const old = db.prepare('SELECT * FROM progress WHERE user_id=? AND lesson_id=?').get(req.user.id, meta.lessonId);
   const oldBest = old ? old.best_score : 0;
   const starsEarned = Math.round(Math.max(0, percent - oldBest) / 100 * meta.starReward);
-
   const tx = db.transaction(() => {
     db.prepare(`INSERT INTO attempts (user_id,kind,ref_id,score_percent,correct_count,total_count,stars_earned,duration_sec,answers_json)
       VALUES (?,?,?,?,?,?,?,?,?)`).run(req.user.id, meta.kind, setId, percent, correct, questions.length, starsEarned, Number(durationSec) || 0, JSON.stringify(answers));
@@ -198,6 +225,17 @@ router.post('/submissions', requireAuth, (req, res) => {
   tx();
   const me = db.prepare('SELECT total_stars FROM users WHERE id=?').get(req.user.id);
   res.json({ scorePercent: percent, correctCount: correct, totalCount: questions.length, starsEarned, totalStars: me.total_stars, detail });
+});
+
+/* Khôi phục lần nộp gần nhất để tải lại trang không làm mất trạng thái đã lưu. */
+router.get('/submissions/:setId/latest', requireAuth, (req, res) => {
+  const row = db.prepare(`SELECT score_percent,correct_count,total_count,stars_earned,answers_json,created_at
+    FROM attempts WHERE user_id=? AND ref_id=? ORDER BY id DESC LIMIT 1`).get(req.user.id, req.params.setId);
+  if (!row) return res.json({ submission: null });
+  let answers = {};
+  try { answers = JSON.parse(row.answers_json || '{}'); } catch (_) {}
+  res.json({ submission: { scorePercent: row.score_percent, correctCount: row.correct_count,
+    totalCount: row.total_count, starsEarned: row.stars_earned, answers, createdAt: row.created_at } });
 });
 
 /* ---------------- Bảng xếp hạng (tính từ dữ liệu thật) ---------------- */
@@ -417,8 +455,9 @@ router.get('/teacher/question-sets/:id/questions', requireTeacher, (req, res) =>
   res.json({ questions: rows.map(r => ({ ...r, options: r.options_json ? JSON.parse(r.options_json) : undefined })) });
 });
 router.post('/teacher/question-sets/:id/questions', requireTeacher, (req, res) => {
-  const { type = 'multiple-choice', prompt = '', options, correctAnswer = '', points = 5, category = '' } = req.body || {};
+  const { type = 'multiple-choice', prompt = '', options, correctAnswer = '', points = 5, category = '', deltaPercent = 10 } = req.body || {};
   if (!prompt.trim() || !String(correctAnswer).trim()) return res.status(400).json({ error: 'Cần nội dung câu hỏi và đáp án đúng.' });
+  if (!Number.isFinite(Number(deltaPercent)) || Number(deltaPercent) < 0 || Number(deltaPercent) > 100) return res.status(400).json({ error: 'Sai số cho phép phải nằm trong khoảng 0–100%.' });
   if (type === 'multiple-choice' && (!Array.isArray(options) || options.length < 2)) {
     return res.status(400).json({ error: 'Câu trắc nghiệm cần ít nhất 2 lựa chọn.' });
   }
@@ -426,15 +465,16 @@ router.post('/teacher/question-sets/:id/questions', requireTeacher, (req, res) =
   const id = `q-${Date.now().toString(36)}`;
   const set = db.prepare('SELECT lesson_id FROM question_sets WHERE id=?').get(req.params.id);
   if (!set) return res.status(404).json({ error: 'Không tìm thấy bộ đề.' });
-  db.prepare('INSERT INTO questions (id,set_id,lesson_id,type,prompt,options_json,correct_answer,points,category,sort_order) VALUES (?,?,?,?,?,?,?,?,?,?)')
-    .run(id, req.params.id, set.lesson_id, type, prompt.trim(), options ? JSON.stringify(options) : null, String(correctAnswer).trim(), Number(points) || 1, String(category).trim(), maxSort + 1);
+  db.prepare('INSERT INTO questions (id,set_id,lesson_id,type,prompt,options_json,correct_answer,points,category,sort_order,delta_percent) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+    .run(id, req.params.id, set.lesson_id, type, prompt.trim(), options ? JSON.stringify(options) : null, String(correctAnswer).trim(), Number(points) || 1, String(category).trim(), maxSort + 1, Number(deltaPercent));
   res.status(201).json({ question: { id } });
 });
 router.put('/teacher/questions/:id', requireTeacher, (req, res) => {
-  const { prompt = '', options, correctAnswer = '', points = 5, category = '' } = req.body || {};
+  const { prompt = '', options, correctAnswer = '', points = 5, category = '', deltaPercent = 10 } = req.body || {};
   if (!prompt.trim() || !String(correctAnswer).trim()) return res.status(400).json({ error: 'Cần nội dung câu hỏi và đáp án đúng.' });
-  const info = db.prepare('UPDATE questions SET prompt=?,options_json=?,correct_answer=?,points=?,category=? WHERE id=?')
-    .run(prompt.trim(), options ? JSON.stringify(options) : null, String(correctAnswer).trim(), Number(points) || 1, String(category).trim(), req.params.id);
+  if (!Number.isFinite(Number(deltaPercent)) || Number(deltaPercent) < 0 || Number(deltaPercent) > 100) return res.status(400).json({ error: 'Sai số cho phép phải nằm trong khoảng 0–100%.' });
+  const info = db.prepare('UPDATE questions SET prompt=?,options_json=?,correct_answer=?,points=?,category=?,delta_percent=? WHERE id=?')
+    .run(prompt.trim(), options ? JSON.stringify(options) : null, String(correctAnswer).trim(), Number(points) || 1, String(category).trim(), Number(deltaPercent) || 10, req.params.id);
   if (!info.changes) return res.status(404).json({ error: 'Không tìm thấy câu hỏi.' });
   res.json({ ok: true });
 });
@@ -538,7 +578,7 @@ router.get('/teacher/analytics', requireTeacher, (req, res) => {
     try { answers = JSON.parse(a.answers_json || '{}'); } catch { answers = {}; }
     Object.entries(answers).forEach(([qid, given]) => {
       const q = qmap[qid]; if (!q) return;
-      const key = q.category || ({ 'multiple-choice': 'Trắc nghiệm', input: 'Điền số', compare: 'Điền dấu so sánh', paint: 'Tô màu theo kết quả' }[q.type] || q.type);
+      const key = q.category || ({ 'multiple-choice': 'Trắc nghiệm', input: 'Điền số', compare: 'Điền dấu so sánh', paint: 'Tô màu theo kết quả', estimate: 'Ước lượng' }[q.type] || q.type);
       wrongBy[key] = wrongBy[key] || { label: key, wrong: 0, total: 0 };
       wrongBy[key].total++;
       if (String(given).trim().toLowerCase() !== String(q.correct_answer).trim().toLowerCase()) wrongBy[key].wrong++;

@@ -77,6 +77,18 @@ document.addEventListener('mathapp:user-ready', async () => {
         if (/Chưa thể vào/.test(label.textContent)) label.textContent = 'Bắt đầu học';
         btn.addEventListener('click', go);
       }
+      // Lối vào riêng cho bài Estimate nhưng vẫn nằm trong thẻ bài học của luồng hiện có.
+      if (lesson.id === 'bai-13' && (lesson.questionSets || []).some(s => s.id === 'bai-13-estimate')) {
+        if (!card.querySelector('[data-estimate-entry]')) {
+          const estimateLink = document.createElement('a');
+          estimateLink.href = `lesson.html?lesson=${lesson.id}&set=bai-13-estimate`;
+          estimateLink.dataset.estimateEntry = 'true';
+          estimateLink.textContent = 'Luyện tập: Ước lượng trước khi tính đúng';
+          estimateLink.className = 'inline-flex items-center justify-center mt-3 px-4 py-3 rounded-2xl bg-secondary-container text-on-secondary-container font-label-md hover:opacity-90';
+          estimateLink.setAttribute('aria-label', 'Mở bài luyện tập Ước lượng');
+          card.appendChild(estimateLink);
+        }
+      }
     });
     // Tiến độ chủ đề trên banner
     const done = lessons.filter((l) => l.completed).length;

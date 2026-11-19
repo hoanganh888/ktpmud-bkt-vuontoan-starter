@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS questions (
   correct_answer TEXT NOT NULL,
   points        INTEGER NOT NULL DEFAULT 1,
   category      TEXT DEFAULT '',
-  sort_order    INTEGER NOT NULL
+  sort_order    INTEGER NOT NULL,
+  delta_percent REAL NOT NULL DEFAULT 10
 );
 CREATE TABLE IF NOT EXISTS attempts (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,6 +108,7 @@ CREATE TABLE IF NOT EXISTS game_scores (
 `);
 
 // Migration an toàn cho DB cũ trên máy chủ / persistent disk
+try { db.exec('ALTER TABLE questions ADD COLUMN delta_percent REAL NOT NULL DEFAULT 10'); } catch (_) {}
 try { db.exec('ALTER TABLE users ADD COLUMN email TEXT'); } catch (_) {}
 try { db.exec('ALTER TABLE users ADD COLUMN avatar TEXT'); } catch (_) {}
 try { db.exec('ALTER TABLE users ADD COLUMN google_id TEXT'); } catch (_) {}
@@ -131,8 +133,8 @@ function seedIfEmpty() {
     VALUES (@username,@passwordHash,@fullName,@role,@className,@studentCode,@totalStars)`);
   const insertLesson = db.prepare(`INSERT INTO lessons (id,number,title,description,topic,sort_order,unlock_after)
     VALUES (@id,@number,@title,@description,@topic,@sortOrder,@unlockAfter)`);
-  const insertQuestion = db.prepare(`INSERT INTO questions (id,set_id,lesson_id,type,prompt,options_json,correct_answer,points,category,sort_order)
-    VALUES (@id,@setId,@lessonId,@type,@prompt,@optionsJson,@correctAnswer,@points,@category,@sortOrder)`);
+  const insertQuestion = db.prepare(`INSERT INTO questions (id,set_id,lesson_id,type,prompt,options_json,correct_answer,points,category,sort_order,delta_percent)
+    VALUES (@id,@setId,@lessonId,@type,@prompt,@optionsJson,@correctAnswer,@points,@category,@sortOrder,@deltaPercent)`);
 
   const tx = db.transaction(() => {
     for (const u of seed.users) {
@@ -144,7 +146,7 @@ function seedIfEmpty() {
         id: q.id, setId, lessonId: set.lessonId, type: q.type, prompt: q.prompt,
         optionsJson: q.options ? JSON.stringify(q.options) : null,
         correctAnswer: q.correctAnswer, points: q.points || 1,
-        category: q.category || '', sortOrder: i + 1,
+        category: q.category || '', sortOrder: i + 1, deltaPercent: q.deltaPercent || 10,
       }));
     }
     // Tiến độ mẫu khớp giao diện cũ của Bảo Nam (Bài 9: 100đ, Bài 10: 80đ)
@@ -159,8 +161,38 @@ function seedIfEmpty() {
   tx();
   console.log('[DB] Đã nạp dữ liệu mẫu từ data/seed.json');
 }
+
 seedIfEmpty();
 seedQuestionSets();
+
+/* Bộ 12 câu Estimate được bổ sung an toàn cả với database đã có dữ liệu. */
+function seedEstimateQuestions() {
+  const lessonId = 'bai-13';
+  const setId = 'bai-13-estimate';
+  db.prepare(`INSERT OR IGNORE INTO question_sets (id,title,kind,lesson_id,star_reward,duration_minutes)
+    VALUES (?,?,?,?,?,?)`).run(setId, 'Luyện tập: Ước lượng trước khi tính đúng', 'exercise', lessonId, 40, 15);
+  const examples = [
+    ['estimate-01', 'Ước lượng 198 + 302 (sai số 10%)', '500'],
+    ['estimate-02', 'Ước lượng 421 + 176 (sai số 10%)', '597'],
+    ['estimate-03', 'Ước lượng 805 - 398 (sai số 10%)', '407'],
+    ['estimate-04', 'Ước lượng 672 - 251 (sai số 10%)', '421'],
+    ['estimate-05', 'Ước lượng 24 × 4 (sai số 10%)', '96'],
+    ['estimate-06', 'Ước lượng 32 × 3 (sai số 10%)', '96'],
+    ['estimate-07', 'Ước lượng 144 : 2 (sai số 10%)', '72'],
+    ['estimate-08', 'Ước lượng 360 : 4 (sai số 10%)', '90'],
+    ['estimate-09', 'Ước lượng 289 + 111 (sai số 10%)', '400'],
+    ['estimate-10', 'Ước lượng 750 - 248 (sai số 10%)', '502'],
+    ['estimate-11', 'Ước lượng 19 × 5 (sai số 10%)', '95'],
+    ['estimate-12', 'Ước lượng 216 : 3 (sai số 10%)', '72']
+  ];
+  const insert = db.prepare(`INSERT OR IGNORE INTO questions
+    (id,set_id,lesson_id,type,prompt,options_json,correct_answer,points,category,sort_order,delta_percent)
+    VALUES (?,?,?,'estimate',?,NULL,?,10,'Ước lượng',?,10)`);
+  const tx = db.transaction(() => examples.forEach((q, i) =>
+    insert.run(q[0], setId, lessonId, q[1], q[2], i + 1)));
+  tx();
+}
+seedEstimateQuestions();
 
 // Đảm bảo thông tin Cô Lan Anh (GV Chủ nhiệm minh họa) và học sinh luôn được cập nhật chính xác
 try {
